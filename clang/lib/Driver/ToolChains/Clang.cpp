@@ -1524,7 +1524,7 @@ static void CollectARMPACBTIOptions(const ToolChain &TC, const ArgList &Args,
       auto isPAuthLR = [](const char *member) {
         llvm::AArch64::ExtensionInfo pauthlr_extension =
             llvm::AArch64::getExtensionByID(llvm::AArch64::AEK_PAUTHLR);
-        return pauthlr_extension.Feature == member;
+        return pauthlr_extension.PosTargetFeature == member;
       };
 
       if (std::any_of(CmdArgs.begin(), CmdArgs.end(), isPAuthLR))
@@ -2648,7 +2648,7 @@ static void CollectArgsForIntegratedAssembler(Compilation &C,
       } else if (Value.starts_with("-mcpu") || Value.starts_with("-mfpu") ||
                  Value.starts_with("-mhwdiv") || Value.starts_with("-march")) {
         // Do nothing, we'll validate it later.
-      } else if (Value == "-defsym") {
+      } else if (Value == "-defsym" || Value == "--defsym") {
         if (A->getNumValues() != 2) {
           D.Diag(diag::err_drv_defsym_invalid_format) << Value;
           break;
@@ -2667,7 +2667,7 @@ static void CollectArgsForIntegratedAssembler(Compilation &C,
           D.Diag(diag::err_drv_defsym_invalid_symval) << SVal;
           break;
         }
-        CmdArgs.push_back(Value.data());
+        CmdArgs.push_back("--defsym");
         TakeNextArg = true;
       } else if (Value == "-fdebug-compilation-dir") {
         CmdArgs.push_back("-fdebug-compilation-dir");
@@ -3666,7 +3666,6 @@ static void RenderHLSLOptions(const ArgList &Args, ArgStringList &CmdArgs,
   const unsigned ForwardedArguments[] = {options::OPT_dxil_validator_version,
                                          options::OPT_D,
                                          options::OPT_I,
-                                         options::OPT_S,
                                          options::OPT_O,
                                          options::OPT_emit_llvm,
                                          options::OPT_emit_obj,
@@ -4939,7 +4938,9 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Args.MakeArgString(NormalizedTriple));
 
     if (JA.isDeviceOffloading(Action::OFK_HIP) &&
-        getToolChain().getTriple().isAMDGPU()) {
+        (getToolChain().getTriple().isAMDGPU() ||
+         (getToolChain().getTriple().isSPIRV() &&
+          getToolChain().getTriple().getVendor() == llvm::Triple::AMD))) {
       // Device side compilation printf
       if (Args.getLastArg(options::OPT_mprintf_kind_EQ)) {
         CmdArgs.push_back(Args.MakeArgString(

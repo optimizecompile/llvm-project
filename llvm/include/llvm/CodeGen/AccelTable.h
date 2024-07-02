@@ -261,7 +261,7 @@ struct OffsetAndUnitID {
   uint64_t Offset = 0;
   uint32_t UnitID = 0;
   bool IsTU = false;
-  OffsetAndUnitID() = default;
+  OffsetAndUnitID() = delete;
   OffsetAndUnitID(uint64_t Offset, uint32_t UnitID, bool IsTU)
       : Offset(Offset), UnitID(UnitID), IsTU(IsTU) {}
   uint64_t offset() const { return Offset; };
@@ -271,14 +271,10 @@ struct OffsetAndUnitID {
 
 template <> struct DenseMapInfo<OffsetAndUnitID> {
   static inline OffsetAndUnitID getEmptyKey() {
-    OffsetAndUnitID Entry;
-    Entry.Offset = uint64_t(-1);
-    return Entry;
+    return OffsetAndUnitID(-1, -1, false);
   }
   static inline OffsetAndUnitID getTombstoneKey() {
-    OffsetAndUnitID Entry;
-    Entry.Offset = uint64_t(-2);
-    return Entry;
+    return OffsetAndUnitID(-2, -2, false);
   }
   static unsigned getHashValue(const OffsetAndUnitID &Val) {
     return (unsigned)llvm::hash_combine(Val.offset(), Val.unitID(), Val.IsTU);
