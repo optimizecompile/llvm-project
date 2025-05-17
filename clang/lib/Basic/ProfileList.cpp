@@ -37,7 +37,7 @@ public:
 
   bool hasPrefix(StringRef Prefix) const {
     for (const auto &It : Sections)
-      if (It.second.Entries.count(Prefix) > 0)
+      if (It.Entries.count(Prefix) > 0)
         return true;
     return false;
   }
@@ -81,6 +81,8 @@ static StringRef getSectionName(CodeGenOptions::ProfileInstrKind Kind) {
     return "llvm";
   case CodeGenOptions::ProfileCSIRInstr:
     return "csllvm";
+  case CodeGenOptions::ProfileIRSampleColdCov:
+    return "sample-coldcov";
   }
   llvm_unreachable("Unhandled CodeGenOptions::ProfileInstrKind enum");
 }
