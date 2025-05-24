@@ -12323,7 +12323,7 @@ SDValue PPCTargetLowering::LowerADDSUBO_CARRY(SDValue Op,
   Opc = IsAdd ? PPCISD::ADDE : PPCISD::SUBE;
   if (!IsAdd)
     CarryOp = DAG.getNode(ISD::XOR, DL, CarryOp.getValueType(), CarryOp,
-                          DAG.getAllOnesConstant(DL, CarryOp.getValueType()));
+                          DAG.getConstant(1UL, DL, CarryOp.getValueType()));
   CarryOp = ConvertCarryValueToCarryFlag(VT, CarryOp, DAG, Subtarget);
   SDValue Sum = DAG.getNode(Opc, DL, DAG.getVTList(VT, MVT::i32),
                             Op.getOperand(0), Op.getOperand(1), CarryOp);
@@ -16562,13 +16562,16 @@ SDValue PPCTargetLowering::PerformDAGCombine(SDNode *N,
                                     MemVT.getSizeInBits());
       SDValue Const64 = DAG.getConstant(Val64, dl, MVT::i64);
 
-      // DAG.getTruncStore() can't be used here because it doesn't accept
-      // the general (base + offset) addressing mode.
-      // So we use UpdateNodeOperands and setTruncatingStore instead.
-      DAG.UpdateNodeOperands(N, N->getOperand(0), Const64, N->getOperand(2),
-                             N->getOperand(3));
-      cast<StoreSDNode>(N)->setTruncatingStore(true);
-      return SDValue(N, 0);
+      auto *ST = cast<StoreSDNode>(N);
+      SDValue NewST = DAG.getStore(ST->getChain(), dl, Const64,
+                                   ST->getBasePtr(), ST->getOffset(), MemVT,
+                                   ST->getMemOperand(), ST->getAddressingMode(),
+                                   /*IsTruncating=*/true);
+      // Note we use CombineTo here to prevent DAGCombiner from visiting the
+      // new store which will change the constant by removing non-demanded bits.
+      return ST->isUnindexed()
+                 ? DCI.CombineTo(N, NewST, /*AddTo=*/false)
+                 : DCI.CombineTo(N, NewST, NewST.getValue(1), /*AddTo=*/false);
     }
 
     // For little endian, VSX stores require generating xxswapd/lxvd2x.
@@ -18453,9 +18456,89 @@ static SDValue stripModuloOnShift(const TargetLowering &TLI, SDNode *N,
   return SDValue();
 }
 
+SDValue PPCTargetLowering::combineVectorShift(SDNode *N,
+                                              DAGCombinerInfo &DCI) const {
+  EVT VT = N->getValueType(0);
+  assert(VT.isVector() && "Vector type expected.");
+
+  unsigned Opc = N->getOpcode();
+  assert((Opc == ISD::SHL || Opc == ISD::SRL || Opc == ISD::SRA) &&
+         "Unexpected opcode.");
+
+  if (!isOperationLegal(Opc, VT))
+    return SDValue();
+
+  EVT EltTy = VT.getScalarType();
+  unsigned EltBits = EltTy.getSizeInBits();
+  if (EltTy != MVT::i64 && EltTy != MVT::i32)
+    return SDValue();
+
+  SDValue N1 = N->getOperand(1);
+  uint64_t SplatBits = 0;
+  bool AddSplatCase = false;
+  unsigned OpcN1 = N1.getOpcode();
+  if (OpcN1 == PPCISD::VADD_SPLAT &&
+      N1.getConstantOperandVal(1) == VT.getVectorNumElements()) {
+    AddSplatCase = true;
+    SplatBits = N1.getConstantOperandVal(0);
+  }
+
+  if (!AddSplatCase) {
+    if (OpcN1 != ISD::BUILD_VECTOR)
+      return SDValue();
+
+    unsigned SplatBitSize;
+    bool HasAnyUndefs;
+    APInt APSplatBits, APSplatUndef;
+    BuildVectorSDNode *BVN = cast<BuildVectorSDNode>(N1);
+    bool BVNIsConstantSplat =
+        BVN->isConstantSplat(APSplatBits, APSplatUndef, SplatBitSize,
+                             HasAnyUndefs, 0, !Subtarget.isLittleEndian());
+    if (!BVNIsConstantSplat || SplatBitSize != EltBits)
+      return SDValue();
+    SplatBits = APSplatBits.getZExtValue();
+  }
+
+  SDLoc DL(N);
+  SDValue N0 = N->getOperand(0);
+  // PPC vector shifts by word/double look at only the low 5/6 bits of the
+  // shift vector, which means the max value is 31/63. A shift vector of all
+  // 1s will be truncated to 31/63, which is useful as vspltiw is limited to
+  // -16 to 15 range.
+  if (SplatBits == (EltBits - 1)) {
+    unsigned NewOpc;
+    switch (Opc) {
+    case ISD::SHL:
+      NewOpc = PPCISD::SHL;
+      break;
+    case ISD::SRL:
+      NewOpc = PPCISD::SRL;
+      break;
+    case ISD::SRA:
+      NewOpc = PPCISD::SRA;
+      break;
+    }
+    SDValue SplatOnes = getCanonicalConstSplat(255, 1, VT, DCI.DAG, DL);
+    return DCI.DAG.getNode(NewOpc, DL, VT, N0, SplatOnes);
+  }
+
+  if (Opc != ISD::SHL || !isOperationLegal(ISD::ADD, VT))
+    return SDValue();
+
+  // For 64-bit there is no splat immediate so we want to catch shift by 1 here
+  // before the BUILD_VECTOR is replaced by a load.
+  if (EltTy != MVT::i64 || SplatBits != 1)
+    return SDValue();
+
+  return DCI.DAG.getNode(ISD::ADD, SDLoc(N), VT, N0, N0);
+}
+
 SDValue PPCTargetLowering::combineSHL(SDNode *N, DAGCombinerInfo &DCI) const {
   if (auto Value = stripModuloOnShift(*this, N, DCI.DAG))
     return Value;
+
+  if (N->getValueType(0).isVector())
+    return combineVectorShift(N, DCI);
 
   SDValue N0 = N->getOperand(0);
   ConstantSDNode *CN1 = dyn_cast<ConstantSDNode>(N->getOperand(1));
@@ -18487,12 +18570,18 @@ SDValue PPCTargetLowering::combineSRA(SDNode *N, DAGCombinerInfo &DCI) const {
   if (auto Value = stripModuloOnShift(*this, N, DCI.DAG))
     return Value;
 
+  if (N->getValueType(0).isVector())
+    return combineVectorShift(N, DCI);
+
   return SDValue();
 }
 
 SDValue PPCTargetLowering::combineSRL(SDNode *N, DAGCombinerInfo &DCI) const {
   if (auto Value = stripModuloOnShift(*this, N, DCI.DAG))
     return Value;
+
+  if (N->getValueType(0).isVector())
+    return combineVectorShift(N, DCI);
 
   return SDValue();
 }
